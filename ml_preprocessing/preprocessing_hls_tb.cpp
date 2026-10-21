@@ -614,18 +614,71 @@ int main()
         failures++;
 
 
-    //----------------------------------------------------------
-    // Summary
-    //----------------------------------------------------------
+    //==========================================================
+        // Z-Score Regression Tests (John Bagshaw Edge Cases)
+        //==========================================================
 
-    cout << "\n=========================================\n";
+        //----------------------------------------------------------
+        // Regression Test 1: Alternating +/- 12 (Variance = 144)
+        // Tests variance > 128 prior to hls::sqrt()
+        //----------------------------------------------------------
+        data_t alt_window[MAX_WINDOWS][MAX_WINDOW_SIZE] = {0};
+        for (int i = 0; i < 64; i++) {
+            alt_window[0][i] = (i % 2 == 0) ? 12.0f : -12.0f;
+        }
 
-    if (failures == 0)
-        cout << "ALL TESTS PASSED\n";
-    else
-        cout << failures << " TEST(S) FAILED\n";
+        normalize_windows_hls(alt_window, 1, 64, NormalizationType::Z_SCORE);
 
-    cout << "=========================================\n";
+        bool pass_reg1 = true;
+        for (int i = 0; i < 64; i++) {
+            float expected = (i % 2 == 0) ? 1.0f : -1.0f;
+            if (fabs(float(alt_window[0][i]) - expected) > 0.05f) {
+                pass_reg1 = false;
+            }
+        }
 
-    return failures;
-}
+        print_result("Z-Score Reg 1 (+/- 12 Alternating)", pass_reg1);
+        if (!pass_reg1) failures++;
+
+
+        //----------------------------------------------------------
+        // Regression Test 2: High StdDev Window (StdDev > 22.6)
+        // Tests var_sum accumulator headroom beyond 32,768
+        //----------------------------------------------------------
+        data_t high_std_window[MAX_WINDOWS][MAX_WINDOW_SIZE] = {0};
+        for (int i = 0; i < 64; i++) {
+            high_std_window[0][i] = (i < 32) ? 50.0f : -50.0f;
+        }
+
+        normalize_windows_hls(high_std_window, 1, 64, NormalizationType::Z_SCORE);
+
+        bool pass_reg2 = true;
+        for (int i = 0; i < 64; i++) {
+            float expected = (i < 32) ? 1.0f : -1.0f;
+            if (fabs(float(high_std_window[0][i]) - expected) > 0.05f) {
+                pass_reg2 = false;
+            }
+        }
+
+        print_result("Z-Score Reg 2 (High StdDev > 22.6)", pass_reg2);
+        if (!pass_reg2) failures++;
+
+
+        //----------------------------------------------------------
+        // Summary
+        //----------------------------------------------------------
+
+        cout << "\n=========================================\n";
+
+        if (failures == 0)
+            cout << "ALL TESTS PASSED\n";
+        else
+            cout << failures << " TEST(S) FAILED\n";
+
+        cout << "=========================================\n";
+
+        return failures;
+    }
+
+
+
