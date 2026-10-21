@@ -60,30 +60,38 @@ void normalize_single_window_hls(
     else if (normalization == NormalizationType::Z_SCORE)
     {
         const data_t EPSILON = 0.001f;
-        typedef ap_fixed<40,16> accum_t;
 
-        accum_t sum = 0;
+        // 1. Sum Accumulator: 20 integer bits to prevent mean accumulation overflow
+        typedef ap_fixed<40,20> sum_t;
+        sum_t sum = 0;
+
         MEAN_LOOP: for (int i = 0; i < MAX_WINDOW_SIZE; i++)
         {
 #pragma HLS PIPELINE II=1
             if (i < window_size)
-                sum += (accum_t)window[i];
+                sum += (sum_t)window[i];
         }
 
         data_t mean = (data_t)(sum / window_size);
 
-        accum_t var_sum = 0;
+        // 2. Variance Accumulator: 24 integer bits (max ~8.38M) to prevent sum of squares overflow
+        typedef ap_fixed<48,24> var_accum_t;
+        var_accum_t var_sum = 0;
+
         VAR_LOOP: for (int i = 0; i < MAX_WINDOW_SIZE; i++)
         {
 #pragma HLS PIPELINE II=1
             if (i < window_size) {
                 data_t diff = window[i] - mean;
-                var_sum += (accum_t)(diff * diff);
+                var_sum += (var_accum_t)(diff * diff);
             }
         }
 
-        data_t variance = (data_t)(var_sum / window_size);
-        data_t stddev = hls::sqrt(variance);
+        // 3. Keep variance wide (var_accum_t) through hls::sqrt to prevent wrapping
+        var_accum_t variance = var_sum / window_size;
+
+        // Evaluate sqrt on wide var_accum_t type BEFORE narrowing to data_t
+        data_t stddev = (data_t)hls::sqrt(variance);
 
         if (stddev < EPSILON) stddev = 1.0f;
 
@@ -98,7 +106,6 @@ void normalize_single_window_hls(
         }
     }
 }
-
 //==============================================================
 // Dataflow Task 1: Read Memory
 //==============================================================
