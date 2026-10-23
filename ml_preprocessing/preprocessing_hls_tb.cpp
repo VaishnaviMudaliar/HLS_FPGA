@@ -664,6 +664,78 @@ int main()
         if (!pass_reg2) failures++;
 
 
+
+        	//----------------------------------------------------------
+            // Regression Test 3: Min-Max Wide Range (-100 to +100)
+            // Range = 200 (> 127.99), tests ap_fixed<25,9> range
+            //----------------------------------------------------------
+            data_t minmax_wide[MAX_WINDOWS][MAX_WINDOW_SIZE] = {0};
+            minmax_wide[0][0] = -100.0f;
+            minmax_wide[0][1] = -50.0f;
+            minmax_wide[0][2] =  50.0f;
+            minmax_wide[0][3] =  100.0f;
+
+            normalize_windows_hls(minmax_wide, 1, 4, NormalizationType::MIN_MAX);
+
+            bool pass_reg3 = true;
+            float expected_mm[4] = {0.0f, 0.25f, 0.75f, 1.0f};
+            for (int i = 0; i < 4; i++) {
+                if (fabs(float(minmax_wide[0][i]) - expected_mm[i]) > 0.05f) {
+                    pass_reg3 = false;
+                }
+            }
+            print_result("Min-Max Wide Span (-100 to +100)", pass_reg3);
+            if (!pass_reg3) failures++;
+
+            //----------------------------------------------------------
+            // Regression Test 4: Z-Score Small StdDev (0.005)
+            // 1 / stddev = 200 (> 127.99), tests ap_fixed<32,12> inv_t
+            //----------------------------------------------------------
+            data_t small_std[MAX_WINDOWS][MAX_WINDOW_SIZE] = {0};
+            small_std[0][0] = -0.005f;
+            small_std[0][1] = -0.005f;
+            small_std[0][2] =  0.005f;
+            small_std[0][3] =  0.005f;
+
+            normalize_windows_hls(small_std, 1, 4, NormalizationType::Z_SCORE);
+
+            bool pass_reg4 = true;
+            for (int i = 0; i < 4; i++) {
+                float exp_val = (i < 2) ? -1.0f : 1.0f;
+                if (fabs(float(small_std[0][i]) - exp_val) > 0.05f) {
+                    pass_reg4 = false;
+                }
+            }
+            print_result("Z-Score Small StdDev (stddev=0.005)", pass_reg4);
+            if (!pass_reg4) failures++;
+
+            //----------------------------------------------------------
+              // Regression Test 5: Sliding Window Count 1024 / Size 4 / Stride 1
+              // Verifies exactly 1021 windows generated
+              //----------------------------------------------------------
+                static data_t test5_input[1024];
+                static data_t test5_output[MAX_WINDOWS][MAX_WINDOW_SIZE];
+
+                for (int i = 0; i < 1024; i++) {
+                    test5_input[i] = (data_t)(i % 50);
+                }
+
+                int test_num_windows = 0;
+                ml_preprocessing_hls(
+                    test5_input,
+                    test5_output,
+                    1024,                       // input_size
+                    4,                          // window_size
+                    1,                          // stride
+                    WindowType::RECTANGULAR,    // window_type
+                    NormalizationType::NONE,    // normalization
+                    test_num_windows            // output window count reference
+                );
+
+                bool pass_reg5 = (test_num_windows == 1021);
+                print_result("Sliding Window 1024/4/1 (1021 Windows)", pass_reg5);
+                if (!pass_reg5) failures++;
+
         //----------------------------------------------------------
         // Summary
         //----------------------------------------------------------
@@ -681,4 +753,4 @@ int main()
     }
 
 
-
+ 

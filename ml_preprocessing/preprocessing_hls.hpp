@@ -10,9 +10,8 @@
 
 constexpr int MAX_INPUT_SIZE  = 1024;
 constexpr int MAX_WINDOW_SIZE = 64;
-constexpr int MAX_WINDOWS     =
-    ((MAX_INPUT_SIZE - MAX_WINDOW_SIZE) + 1);
-
+// Guarantees allocation headroom for worst-case window size (e.g. min window size = 1 or 4)
+constexpr int MAX_WINDOWS     = MAX_INPUT_SIZE;
 //==============================================================
 // Data Type
 //==============================================================

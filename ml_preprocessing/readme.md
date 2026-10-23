@@ -1,6 +1,4 @@
 
-
-
 # HLS ML Preprocessing Block
 
 Hardware-accelerated machine learning preprocessing kernel implemented using **Vitis HLS**.
@@ -19,7 +17,7 @@ This project implements an end-to-end, single-pass streaming preprocessing pipel
 
 ## Architecture Overview
 
-The pipeline uses a **Single-Pass Streaming DATAFLOW Architecture**. Intermediate multi-pass external memory round-trips have been eliminated by streaming data concurrently between tasks using `hls::stream<>` FIFOs.
+The pipeline uses a **Single-Pass Streaming DATAFLOW Architecture**. Intermediate multi-pass external memory round-trips have been eliminated by streaming data concurrently between tasks using point-to-point `hls::stream<>` FIFOs and configuration channels.
 
 
 ```
@@ -33,17 +31,17 @@ The pipeline uses a **Single-Pass Streaming DATAFLOW Architecture**. Intermediat
             │ hls::stream
             ▼
 ┌───────────────────────┐
-│ Window Generator Task │  <-- Buffers only 1 window (MAX_WINDOW_SIZE)
+│ Window Generator Task │   <-- Buffers only 1 window (MAX_WINDOW_SIZE)
 └───────────┬───────────┘
             │ hls::stream
             ▼
 ┌───────────────────────┐
-│ Apply Window Task     │  <-- Dynamic Hamming / Hann / Rectangular
+│ Apply Window Task     │   <-- Dynamic Hamming / Hann / Rectangular
 └───────────┬───────────┘
             │ hls::stream
             ▼
 ┌───────────────────────┐
-│ Normalization Task    │  <-- Pipelined Min-Max / Z-Score (II=1)
+│ Normalization Task    │   <-- Pipelined Min-Max / Z-Score (II=1)
 └───────────┬───────────┘
             │
             ▼
@@ -57,8 +55,9 @@ The pipeline uses a **Single-Pass Streaming DATAFLOW Architecture**. Intermediat
 
 ### 1. Sliding Window Generation
 Generates overlapping or contiguous windows from time-series input sequences.
-- **Configurable Parameters**: Input size, Window size (up to 64), Stride.
+- **Configurable Parameters**: Input size (up to 1024), Window size (up to 64), Stride.
 - **Memory Efficiency**: Local storage is restricted to **1 single window buffer** (64 samples) rather than storing the full matrix in external DDR.
+- **Pipeline Optimization**: Unrolled parallel register shifting and indexing eliminates memory dependency violations to achieve **Initiation Interval (II) = 1**.
 
 ### 2. Window Functions
 Dynamic coefficient generation supporting window sizes up to `MAX_WINDOW_SIZE = 64`:
@@ -80,17 +79,20 @@ Dynamic coefficient generation supporting window sizes up to `MAX_WINDOW_SIZE = 
 ## Hardware Implementation Details
 
 ### Fixed-Point Precision & Numerics
-- **Base Data Type**: `ap_fixed<24,8>` (Provides 8 integer bits and 16 fractional bits).
+- **Base Data Type**: `data_t` = `ap_fixed<24,8>` (8 integer bits, 16 fractional bits, range $[-128, 127.99]$).
+- **Intermediate Span Precision**:
+  - Difference (`diff`) and range (`range`) widened to `ap_fixed<25,9>` (range $[-256, 255.99]$) to prevent intermediate integer wrapping on wide spans (e.g., $-100$ to $+100$).
+  - Reciprocal scale factors (`inv_range` and `inv_stddev`) expanded to `inv_t` = `ap_fixed<32,12>` (12 integer bits), supporting scale multipliers up to 2047 without wrapping on fine-grained signals with small standard deviations ($\sigma = 0.005$).
 - **Expanded Accumulator Headroom**: 
   - Mean accumulator widened to `ap_fixed<40,20>` (20 integer bits) to prevent summation overflow across 64 samples.
   - Variance sum accumulator (`var_sum`) expanded to `ap_fixed<48,24>` (24 integer bits / max range $\approx 8.38 \times 10^6$), preventing intermediate accumulation wrapping on high standard deviation windows ($\text{stddev} > 22.6$).
 - **Precision Preservation**: Standard deviation calculation applies `hls::sqrt()` directly on wide variance arithmetic before casting down to `data_t` resolution, preventing wrapping on large variances ($\text{variance} > 128$).
 
 ### HLS Optimizations Applied
-- `#pragma HLS DATAFLOW`: Task-level concurrency between memory access, windowing, and normalization.
+- `#pragma HLS DATAFLOW`: Task-level concurrency across memory read, windowing, coefficient applying, and normalization stages.
 - `#pragma HLS PIPELINE II=1`: Applied across all inner sample-processing loops.
 - **Reciprocal Pre-calculation**: Avoids logic-heavy division hardware inside loop pipelines.
-- `#pragma HLS ARRAY_PARTITION`: Applied to local window buffers to enable parallel register-file access.
+- `#pragma HLS ARRAY_PARTITION complete`: Applied to local window buffers to resolve inter-iteration memory dependencies and enable parallel register access.
 
 ### Top-Level Interface
 ```cpp
@@ -122,13 +124,21 @@ void ml_preprocessing_hls(
 
 ### Resource Comparison Across Iterations
 
-| Resource | Initial Version | Intermediate DATAFLOW | Final Version (Wide Math & Edge Fixes) | Total Reduction vs. Initial |
+| Resource | Initial Version | Intermediate DATAFLOW | Final Version (All Edge Fixes & Clean II=1) | Total Reduction vs. Initial |
 | --- | --- | --- | --- | --- |
-| **LUTs** | 178,103 (65.0%) | 22,079 (8.05%) | **29,873 (10.9%)** | **~83.2% Reduction** |
-| **FFs** | 147,658 (27.0%) | 18,763 (3.42%) | **20,839 (3.80%)** | **~85.9% Reduction** |
-| **BRAMs** | 260 (28.5%) | 12 (1.31%) | **12 (1.31%)** | **~95.3% Reduction** |
-| **DSPs** | 10 (0.4%) | 34 (1.35%) | **34 (1.35%)** | **+24 (Mapped logic to DSPs)** |
+| **LUTs** | 178,103 (65.0%) | 22,079 (8.05%) | **32,132 (11.6%)** | **~82.0% Reduction** |
+| **FFs** | 147,658 (27.0%) | 18,763 (3.42%) | **25,000 (4.58%)** | **~83.1% Reduction** |
+| **BRAMs** | 260 (28.5%) | 12 (1.31%) | **10 (1.09%)** | **~96.1% Reduction** |
+| **DSPs** | 10 (0.4%) | 34 (1.35%) | **35 (1.39%)** | **+25 (Mapped logic to DSPs)** |
+| **Memory Dependency Violations** | Memory Dependency | II Violation (II=64) | **0 (Resolved to II=1)** | **Clean Pipeline Execution** |
 | **Memory Passes** | 3 DDR Round-trips | 1 Pass (Streaming) | **1 Pass (Streaming)** | **Eliminated DDR bottlenecks** |
+
+### Per-Task Sub-Block Breakdown
+
+* **`read_input_task`**: 325 LUTs, 124 FFs, 0 DSPs, 0 BRAMs
+* **`window_gen_task`**: 2,691 LUTs, 4,139 FFs, 0 DSPs, 0 BRAMs
+* **`apply_window_task`**: 6,807 LUTs, 5,719 FFs, 28 DSPs, 0 BRAMs
+* **`normalize_store_task`**: 19,626 LUTs, 12,469 FFs, 7 DSPs, 0 BRAMs
 
 ---
 
@@ -136,7 +146,7 @@ void ml_preprocessing_hls(
 
 Self-checking testbench (`tb.cpp`) with non-zero return codes on failure. Verified through **Vitis HLS C Simulation (CSIM)**.
 
-| Test Case | Test Description / Size | Status |
+| Test Case | Test Description / Parameter Scope | Status |
 | --- | --- | --- |
 | **Sliding Window Generation** | Window count and value extraction (Sizes 4, 8, 16) | ✅ PASS |
 | **Rectangular Window** | Window coefficient verification (Sizes 4, 8, 16) | ✅ PASS |
@@ -147,6 +157,9 @@ Self-checking testbench (`tb.cpp`) with non-zero return codes on failure. Verifi
 | **Complete Processing Pipeline** | End-to-end kernel execution across all stages | ✅ PASS |
 | **Z-Score Regression 1** | Alternating $\pm 12$ window ($\text{Variance} = 144 > 128$) | ✅ PASS |
 | **Z-Score Regression 2** | High StdDev window (`var_sum` > 32,768, StdDev > 22.6) | ✅ PASS |
+| **Min-Max Wide Span** | Wide range $-100$ to $+100$ ($\text{range} = 200$), tests `ap_fixed<25,9>` | ✅ PASS |
+| **Z-Score Small StdDev** | Small standard deviation ($\sigma = 0.005$, $\text{multiplier} = 200$), tests `ap_fixed<32,12>` | ✅ PASS |
+| **Sliding Window Bounds** | 1024 samples, window size 4, stride 1 (generates exactly 1021 windows) | ✅ PASS |
 
 ---
 
@@ -165,6 +178,3 @@ Self-checking testbench (`tb.cpp`) with non-zero return codes on failure. Verifi
 
 Distributed under the MIT License.
 
-```
-
-```
