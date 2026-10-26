@@ -16,7 +16,15 @@ constexpr int MAX_WINDOWS     = MAX_INPUT_SIZE;
 // Data Type
 //==============================================================
 
-using data_t = ap_fixed<24,8>;
+// Base data type (8 integer bits, range -128 to +127.99)
+typedef ap_fixed<24, 8> data_t;
+
+// Expanded intermediate span types
+typedef ap_fixed<25, 9> span_t;
+
+// Expanded reciprocal multiplier type (15 integer bits, range -16384 to +16383.99)
+// Supports small standard deviations down to EPSILON (0.0001 -> scale = 10,000)
+typedef ap_fixed<32, 15> inv_t;
 
 //==============================================================
 // Supported Window Functions

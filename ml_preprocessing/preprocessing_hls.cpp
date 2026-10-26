@@ -164,14 +164,14 @@ void window_gen_task(
 #pragma HLS PIPELINE II=1
         data_t sample = in_stream.read();
 
-        for (int j = 0; j < MAX_WINDOW_SIZE - 1; j++) {
+        SHIFT_LOOP: for (int j = 0; j < MAX_WINDOW_SIZE - 1; j++) {
 #pragma HLS UNROLL
             line_buffer[j] = line_buffer[j + 1];
         }
         line_buffer[MAX_WINDOW_SIZE - 1] = sample;
 
         if (i >= window_size - 1 && ((i - (window_size - 1)) % stride == 0)) {
-            STREAM_OUT: for (int w = 0; w < window_size; w++) {
+            STREAM_WINDOW: for (int w = 0; w < window_size; w++) {
 #pragma HLS PIPELINE II=1
                 window_out_stream.write(line_buffer[MAX_WINDOW_SIZE - window_size + w]);
             }
@@ -348,16 +348,16 @@ void ml_preprocessing_hls(
     NormalizationType normalization,
     int &num_windows)
 {
-#pragma HLS INTERFACE m_axi port=input offset=slave bundle=gmem max_read_burst_length=64
-#pragma HLS INTERFACE m_axi port=output offset=slave bundle=gmem max_write_burst_length=64
+#pragma HLS INTERFACE m_axi port=input offset=slave bundle=gmem depth=1024 max_read_burst_length=64
+#pragma HLS INTERFACE m_axi port=output offset=slave bundle=gmem depth=65536 max_write_burst_length=64
 
-#pragma HLS INTERFACE s_axilite port=input_size
-#pragma HLS INTERFACE s_axilite port=window_size
-#pragma HLS INTERFACE s_axilite port=stride
-#pragma HLS INTERFACE s_axilite port=window_type
-#pragma HLS INTERFACE s_axilite port=normalization
-#pragma HLS INTERFACE s_axilite port=num_windows
-#pragma HLS INTERFACE s_axilite port=return
+#pragma HLS INTERFACE s_axilite port=input_size bundle=control
+#pragma HLS INTERFACE s_axilite port=window_size bundle=control
+#pragma HLS INTERFACE s_axilite port=stride bundle=control
+#pragma HLS INTERFACE s_axilite port=window_type bundle=control
+#pragma HLS INTERFACE s_axilite port=normalization bundle=control
+#pragma HLS INTERFACE s_axilite port=num_windows bundle=control
+#pragma HLS INTERFACE s_axilite port=return bundle=control
 
     if (input_size > MAX_INPUT_SIZE || input_size <= 0 ||
         window_size <= 0 || window_size > MAX_WINDOW_SIZE ||
@@ -371,42 +371,42 @@ void ml_preprocessing_hls(
     num_windows = n_win;
 
     config_t cfg;
-    cfg.input_size = input_size;
-    cfg.window_size = window_size;
-    cfg.stride = stride;
-    cfg.n_win = n_win;
-    cfg.window_type = window_type;
+    cfg.input_size   = input_size;
+    cfg.window_size  = window_size;
+    cfg.stride       = stride;
+    cfg.n_win        = n_win;
+    cfg.window_type  = window_type;
     cfg.normalization = normalization;
 
-    // Data FIFOs
+    // Data FIFOs - Sized to prevent HLS 214-114 task stalls on large window counts
     hls::stream<data_t> in_fifo("in_fifo");
     hls::stream<data_t> window_fifo("window_fifo");
     hls::stream<data_t> coeff_fifo("coeff_fifo");
 
-    // Configuration FIFOs (Point-to-Point Chain across 4 DATAFLOW stages)
+    // Configuration FIFOs (Point-to-Point Chain across DATAFLOW stages)
     hls::stream<config_t> cfg_c1("cfg_c1");
     hls::stream<config_t> cfg_c2("cfg_c2");
     hls::stream<config_t> cfg_c3("cfg_c3");
 
 #pragma HLS STREAM variable=in_fifo depth=1024
-#pragma HLS STREAM variable=window_fifo depth=64
-#pragma HLS STREAM variable=coeff_fifo depth=64
+#pragma HLS STREAM variable=window_fifo depth=4096
+#pragma HLS STREAM variable=coeff_fifo depth=4096
 
-#pragma HLS STREAM variable=cfg_c1 depth=2
-#pragma HLS STREAM variable=cfg_c2 depth=2
-#pragma HLS STREAM variable=cfg_c3 depth=2
+#pragma HLS STREAM variable=cfg_c1 depth=4
+#pragma HLS STREAM variable=cfg_c2 depth=4
+#pragma HLS STREAM variable=cfg_c3 depth=4
 
 #pragma HLS DATAFLOW
 
-    // Stage 1: Pass cfg_c1 (stream out) as 3rd parameter and cfg (struct in) as 4th parameter
-        read_input_task(input, in_fifo, cfg_c1, cfg);
+    // Stage 1: Read input array into stream and pass configuration struct down pipeline
+    read_input_task(input, in_fifo, cfg_c1, cfg);
 
-        // Stage 2: Read cfg_c1, write cfg_c2, generate sliding windows
-        window_gen_task(in_fifo, window_fifo, cfg_c1, cfg_c2);
+    // Stage 2: Generate sliding windows with zero-overhead counter (II=1)
+    window_gen_task(in_fifo, window_fifo, cfg_c1, cfg_c2);
 
-        // Stage 3: Read cfg_c2, write cfg_c3, apply Hamming/Hann/Rect window
-        apply_window_task(window_fifo, coeff_fifo, cfg_c2, cfg_c3);
+    // Stage 3: Apply Hamming / Hann / Rectangular window function
+    apply_window_task(window_fifo, coeff_fifo, cfg_c2, cfg_c3);
 
-        // Stage 4: Read cfg_c3, perform normalization and store to output interface
-        normalize_store_task(coeff_fifo, output, cfg_c3);
+    // Stage 4: Perform Min-Max / Z-Score normalization and store to m_axi interface
+    normalize_store_task(coeff_fifo, output, cfg_c3);
 }

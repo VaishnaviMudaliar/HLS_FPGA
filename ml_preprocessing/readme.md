@@ -57,7 +57,7 @@ The pipeline uses a **Single-Pass Streaming DATAFLOW Architecture**. Intermediat
 Generates overlapping or contiguous windows from time-series input sequences.
 - **Configurable Parameters**: Input size (up to 1024), Window size (up to 64), Stride.
 - **Memory Efficiency**: Local storage is restricted to **1 single window buffer** (64 samples) rather than storing the full matrix in external DDR.
-- **Pipeline Optimization**: Unrolled parallel register shifting and indexing eliminates memory dependency violations to achieve **Initiation Interval (II) = 1**.
+- **Pipeline Optimization**: Unrolled parallel register shifting and dedicated streaming pipeline loop (`STREAM_WINDOW`) eliminates memory dependency violations to achieve **Initiation Interval (II) = 1**.
 
 ### 2. Window Functions
 Dynamic coefficient generation supporting window sizes up to `MAX_WINDOW_SIZE = 64`:
@@ -81,8 +81,8 @@ Dynamic coefficient generation supporting window sizes up to `MAX_WINDOW_SIZE = 
 ### Fixed-Point Precision & Numerics
 - **Base Data Type**: `data_t` = `ap_fixed<24,8>` (8 integer bits, 16 fractional bits, range $[-128, 127.99]$).
 - **Intermediate Span Precision**:
-  - Difference (`diff`) and range (`range`) widened to `ap_fixed<25,9>` (range $[-256, 255.99]$) to prevent intermediate integer wrapping on wide spans (e.g., $-100$ to $+100$).
-  - Reciprocal scale factors (`inv_range` and `inv_stddev`) expanded to `inv_t` = `ap_fixed<32,12>` (12 integer bits), supporting scale multipliers up to 2047 without wrapping on fine-grained signals with small standard deviations ($\sigma = 0.005$).
+  - Difference (`diff`) and range (`range`) widened to `span_t` = `ap_fixed<25,9>` (range $[-256, 255.99]$) to prevent intermediate integer wrapping on wide spans (e.g., $-100$ to $+100$).
+  - Reciprocal scale factors (`inv_range` and `inv_stddev`) expanded to `inv_t` = `ap_fixed<32,15>` (15 integer bits), supporting scale multipliers up to 16,383 without wrapping on fine-grained signals with standard deviations near `EPSILON = 0.0001`.
 - **Expanded Accumulator Headroom**: 
   - Mean accumulator widened to `ap_fixed<40,20>` (20 integer bits) to prevent summation overflow across 64 samples.
   - Variance sum accumulator (`var_sum`) expanded to `ap_fixed<48,24>` (24 integer bits / max range $\approx 8.38 \times 10^6$), preventing intermediate accumulation wrapping on high standard deviation windows ($\text{stddev} > 22.6$).
@@ -91,6 +91,7 @@ Dynamic coefficient generation supporting window sizes up to `MAX_WINDOW_SIZE = 
 ### HLS Optimizations Applied
 - `#pragma HLS DATAFLOW`: Task-level concurrency across memory read, windowing, coefficient applying, and normalization stages.
 - `#pragma HLS PIPELINE II=1`: Applied across all inner sample-processing loops.
+- **Deep Streaming FIFOs**: Channel depths set to 4,096 (`window_fifo` and `coeff_fifo`) to accommodate up to 4,084 data words without triggering `HLS 214-114` sequentialization stalls during co-simulation.
 - **Reciprocal Pre-calculation**: Avoids logic-heavy division hardware inside loop pipelines.
 - `#pragma HLS ARRAY_PARTITION complete`: Applied to local window buffers to resolve inter-iteration memory dependencies and enable parallel register access.
 
@@ -118,25 +119,25 @@ void ml_preprocessing_hls(
 
 ### Configuration & Target Hardware
 
-* **Tool**: Vitis HLS 2023.2
+* **Tool**: Vitis HLS 2023.2 / 2025.2
 * **Target Device**: Zynq UltraScale+ MPSoC ZCU102 (`xczu9eg-ffvb1156-2-e`)
 * **Clock Target**: 10.0 ns (100 MHz) | **Estimated**: ~7.3 ns
 
 ### Resource Comparison Across Iterations
 
-| Resource | Initial Version | Intermediate DATAFLOW | Final Version (All Edge Fixes & Clean II=1) | Total Reduction vs. Initial |
+| Resource | Initial Baseline | Intermediate DATAFLOW | Final Version (All Edge Fixes & Clean II=1) | Total Reduction vs. Initial |
 | --- | --- | --- | --- | --- |
-| **LUTs** | 178,103 (65.0%) | 22,079 (8.05%) | **32,132 (11.6%)** | **~82.0% Reduction** |
-| **FFs** | 147,658 (27.0%) | 18,763 (3.42%) | **25,000 (4.58%)** | **~83.1% Reduction** |
-| **BRAMs** | 260 (28.5%) | 12 (1.31%) | **10 (1.09%)** | **~96.1% Reduction** |
+| **LUTs** | 178,103 (65.0%) | 22,079 (8.05%) | **32,198 (11.7%)** | **~81.9% Reduction** |
+| **FFs** | 147,658 (27.0%) | 18,763 (3.42%) | **25,046 (4.59%)** | **~83.0% Reduction** |
+| **BRAMs** | 260 (28.5%) | 12 (1.31%) | **18 (1.96%)** | **~93.1% Reduction** |
 | **DSPs** | 10 (0.4%) | 34 (1.35%) | **35 (1.39%)** | **+25 (Mapped logic to DSPs)** |
-| **Memory Dependency Violations** | Memory Dependency | II Violation (II=64) | **0 (Resolved to II=1)** | **Clean Pipeline Execution** |
+| **II Violations** | Memory Dependency | II Violation (II=64) | **0 (Resolved to II=1)** | **Clean Pipeline Execution** |
 | **Memory Passes** | 3 DDR Round-trips | 1 Pass (Streaming) | **1 Pass (Streaming)** | **Eliminated DDR bottlenecks** |
 
 ### Per-Task Sub-Block Breakdown
 
 * **`read_input_task`**: 325 LUTs, 124 FFs, 0 DSPs, 0 BRAMs
-* **`window_gen_task`**: 2,691 LUTs, 4,139 FFs, 0 DSPs, 0 BRAMs
+* **`window_gen_task`**: 2,691 LUTs, 4,139 FFs, 0 DSPs, 0 BRAMs (II=1 streaming via `STREAM_WINDOW`)
 * **`apply_window_task`**: 6,807 LUTs, 5,719 FFs, 28 DSPs, 0 BRAMs
 * **`normalize_store_task`**: 19,626 LUTs, 12,469 FFs, 7 DSPs, 0 BRAMs
 
@@ -144,7 +145,7 @@ void ml_preprocessing_hls(
 
 ## Verification & Test Coverage
 
-Self-checking testbench (`tb.cpp`) with non-zero return codes on failure. Verified through **Vitis HLS C Simulation (CSIM)**.
+Self-checking testbench (`tb.cpp`) with non-zero return codes on failure. Verified through **Vitis HLS C Simulation (CSIM)** across 20 test cases.
 
 | Test Case | Test Description / Parameter Scope | Status |
 | --- | --- | --- |
@@ -158,7 +159,7 @@ Self-checking testbench (`tb.cpp`) with non-zero return codes on failure. Verifi
 | **Z-Score Regression 1** | Alternating $\pm 12$ window ($\text{Variance} = 144 > 128$) | ✅ PASS |
 | **Z-Score Regression 2** | High StdDev window (`var_sum` > 32,768, StdDev > 22.6) | ✅ PASS |
 | **Min-Max Wide Span** | Wide range $-100$ to $+100$ ($\text{range} = 200$), tests `ap_fixed<25,9>` | ✅ PASS |
-| **Z-Score Small StdDev** | Small standard deviation ($\sigma = 0.005$, $\text{multiplier} = 200$), tests `ap_fixed<32,12>` | ✅ PASS |
+| **Z-Score Small StdDev** | Small standard deviation ($\sigma = 0.005$, $\text{multiplier} = 200$), tests `ap_fixed<32,15>` | ✅ PASS |
 | **Sliding Window Bounds** | 1024 samples, window size 4, stride 1 (generates exactly 1021 windows) | ✅ PASS |
 
 ---
